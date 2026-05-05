@@ -205,7 +205,8 @@ impl WorkerActivityTasks {
             start_tasks_stream_complete.clone(),
         );
         let (cancels_tx, cancels_rx) = unbounded_channel();
-        let heartbeat_manager = ActivityHeartbeatManager::new(client, cancels_tx.clone());
+        let heartbeat_manager =
+            ActivityHeartbeatManager::new(client, cancels_tx.clone(), metrics.clone());
         let complete_notify = Arc::new(Notify::new());
         let source_stream = stream::select_with_strategy(
             UnboundedReceiverStream::new(cancels_rx).map(ActivityTaskSource::from),

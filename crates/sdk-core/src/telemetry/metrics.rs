@@ -43,6 +43,14 @@ struct Instruments {
     act_poll_no_task: Counter,
     act_task_received_counter: Counter,
     act_execution_failed: Counter,
+    /// Counts activity heartbeat RPCs whose SDK-side local timeout
+    /// elapsed (the per-call `tokio::time::timeout` wrap in
+    /// `activity_heartbeat_manager.rs`). Heartbeat state is reset via
+    /// `CompleteReport` so subsequent heartbeats may proceed. Required
+    /// to distinguish "patch fired" from "no wedge occurred" — without
+    /// this counter, the per-call timeout patch is unfalsifiable in
+    /// production.
+    heartbeat_rpc_local_timeout: Counter,
     act_sched_to_start_latency: HistogramDuration,
     act_exec_latency: HistogramDuration,
     act_exec_succeeded_latency: HistogramDuration,
@@ -195,6 +203,16 @@ impl MetricsContext {
     /// An activity execution failed
     pub(crate) fn act_execution_failed(&self) {
         self.instruments.act_execution_failed.adds(1);
+    }
+
+    /// An activity heartbeat RPC's SDK-side local timeout elapsed. The
+    /// `tokio::time::timeout` wrap in `activity_heartbeat_manager.rs`
+    /// exists to recover from silently-wedged sockets (no FIN/RST/GOAWAY);
+    /// each increment indicates the wrap fired and `CompleteReport` was
+    /// dispatched to reset the in-flight flag. Used to prove the
+    /// recovery path is exercised in production.
+    pub(crate) fn heartbeat_rpc_local_timeout(&self) {
+        self.instruments.heartbeat_rpc_local_timeout.adds(1);
     }
 
     /// Record end-to-end (sched-to-complete) time for successful activity executions
@@ -398,6 +416,15 @@ impl Instruments {
                 description: "Count of activity task execution failures".into(),
                 unit: "".into(),
             }),
+            heartbeat_rpc_local_timeout: meter.counter(MetricParameters {
+                name: "activity_heartbeat_rpc_local_timeout".into(),
+                description: "Count of activity heartbeat RPCs whose \
+                              SDK-side local timeout elapsed; heartbeat \
+                              state is reset so later heartbeats may \
+                              proceed."
+                    .into(),
+                unit: "".into(),
+            }),
             act_sched_to_start_latency: meter.histogram_duration(MetricParameters {
                 name: ACTIVITY_SCHED_TO_START_LATENCY_HISTOGRAM_NAME.into(),
                 unit: "duration".into(),
@@ -540,6 +567,8 @@ impl Instruments {
         self.act_task_received_counter
             .update_attributes(new_attributes.clone());
         self.act_execution_failed
+            .update_attributes(new_attributes.clone());
+        self.heartbeat_rpc_local_timeout
             .update_attributes(new_attributes.clone());
         self.act_sched_to_start_latency
             .update_attributes(new_attributes.clone());
@@ -1187,7 +1216,7 @@ mod tests {
         a2.set(Arc::new(DummyCustomAttrs(2))).unwrap();
         // Verify all metrics are created. This number will need to get updated any time a metric
         // is added.
-        let num_metrics = 35;
+        let num_metrics = 36;
         #[allow(clippy::needless_range_loop)] // Sorry clippy, this reads easier.
         for metric_num in 2..=num_metrics + 1 {
             let hole = assert_matches!(&events[metric_num],
@@ -1231,6 +1260,111 @@ mod tests {
             if DummyCustomAttrs::as_id(attributes) == 3 && instrument.get().0 == 12
                && d == &Duration::from_secs(1)
         );
+    }
+
+    /// Regression test for the heartbeat-rpc-local-timeout counter.
+    ///
+    /// The patched `activity_heartbeat_manager.rs` increments
+    /// `MetricsContext::heartbeat_rpc_local_timeout()` inside the
+    /// `Err(_elapsed)` arm of the `tokio::time::timeout` wrap. Without
+    /// this counter the per-call timeout patch is unfalsifiable in
+    /// production. This test fails loudly if a future contributor
+    /// accidentally removes the field, the method, or the increment.
+    ///
+    /// Surface name in Prometheus output:
+    /// `temporal_activity_heartbeat_rpc_local_timeout_total`. The
+    /// `temporal_` prefix is added by `PrefixedMetricsMeter` between
+    /// `Instruments::new` and the underlying `CoreMeter` sink (visible
+    /// in this test's call-buffer events). The `_total` suffix is
+    /// auto-appended by Prometheus exporters per the OpenMetrics spec.
+    #[test]
+    fn test_heartbeat_rpc_local_timeout_metric() {
+        let call_buffer = Arc::new(MetricsCallBuffer::new(100));
+        let telem_instance = telemetry_init(
+            TelemetryOptions::builder()
+                .metrics(call_buffer.clone() as Arc<dyn CoreMeter>)
+                .build(),
+        )
+        .unwrap();
+        let mc = MetricsContext::top_level("ns".to_string(), "tq".to_string(), &telem_instance);
+
+        // Fire the increment that the patched Err(_elapsed) arm performs.
+        // Single retrieve afterwards — `MetricsCallBuffer::retrieve()` drains
+        // the buffer, so all CreateAttributes + Create + Update events appear
+        // together in a single ordered slice. (Two-retrieve patterns lose the
+        // earlier events.)
+        mc.heartbeat_rpc_local_timeout();
+        let events = call_buffer.retrieve();
+
+        // `LazyRef::get()` panics if unset, so we must `set()` every Create
+        // event's `populate_into` before iterating Update events. Each Create
+        // gets a sequential index; we capture the index assigned to our
+        // metric for use as a downstream filter.
+        let mut our_metric_idx: Option<usize> = None;
+        let mut next_idx: usize = 0;
+        for event in &events {
+            if let MetricEvent::Create {
+                params,
+                populate_into,
+                kind,
+            } = event
+            {
+                populate_into
+                    .set(Arc::new(DummyInstrumentRef(next_idx)))
+                    .unwrap();
+                // The `temporal_` prefix is applied by `PrefixedMetricsMeter`
+                // between Instruments::new and the CoreMeter sink, so buffered
+                // Create events carry the prefixed name. Use ends_with to
+                // remain robust against future prefix changes.
+                if params
+                    .name
+                    .ends_with("activity_heartbeat_rpc_local_timeout")
+                {
+                    assert_matches!(kind, MetricKind::Counter);
+                    our_metric_idx = Some(next_idx);
+                }
+                next_idx += 1;
+            }
+        }
+        let our_metric_idx = our_metric_idx.unwrap_or_else(|| {
+            let names: Vec<String> = events
+                .iter()
+                .filter_map(|e| match e {
+                    MetricEvent::Create { params, .. } => Some(params.name.to_string()),
+                    _ => None,
+                })
+                .collect();
+            panic!(
+                "activity_heartbeat_rpc_local_timeout must be declared on Instruments \
+                 and constructed in Instruments::new. Got {} create events: {:?}",
+                names.len(),
+                names
+            );
+        });
+        // Tie attribute slots so Update events have valid attribute refs.
+        for event in &events {
+            if let MetricEvent::CreateAttributes { populate_into, .. } = event {
+                let _ = populate_into.set(Arc::new(DummyCustomAttrs(0)));
+            }
+        }
+
+        // Verify exactly one Update event hit our instrument with Delta(1).
+        let updates: Vec<MetricUpdateVal> = events
+            .iter()
+            .filter_map(|e| match e {
+                MetricEvent::Update {
+                    instrument, update, ..
+                } if instrument.get().0 == our_metric_idx => Some(*update),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            updates.len(),
+            1,
+            "expected exactly one Update event for heartbeat_rpc_local_timeout, got {}",
+            updates.len()
+        );
+        assert_matches!(updates[0], MetricUpdateVal::Delta(1));
     }
 
     #[test]
