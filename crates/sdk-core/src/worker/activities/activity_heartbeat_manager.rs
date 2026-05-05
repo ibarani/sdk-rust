@@ -142,13 +142,38 @@ impl ActivityHeartbeatManager {
                             };
                             }
                             HeartbeatExecutorAction::Report { task_token: tt, details } => {
-                                match sg
-                                    .record_activity_heartbeat(tt.clone(), details.into_payloads())
-                                    .await
+                                // Per-call deadline on the heartbeat RPC. Without this, a
+                                // silently-wedged TCP socket (no FIN/RST/GOAWAY, e.g. mid-path
+                                // idle eviction or transparent proxy bug) leaves this `.await`
+                                // hung indefinitely. The state's `is_record_in_flight` flag
+                                // stays true forever, and all subsequent heartbeats get
+                                // silently coalesced into pending details — so the server
+                                // observes radio silence and fires TIMEOUT_TYPE_HEARTBEAT.
+                                //
+                                // The server-side `grpc-timeout` header (set in client/src/lib.rs
+                                // OTHER_CALL_TIMEOUT) does not protect against this: it is
+                                // server-enforced, and a wedged socket means the server never
+                                // sees the request, so the deadline is never enforced.
+                                //
+                                // 10s is tuned to fire well before the 30s server-side
+                                // activity heartbeat_timeout while leaving generous headroom
+                                // for legitimate slow heartbeats over Tailscale/mTLS paths.
+                                // On timeout, the Tonic future is dropped — h2 will send
+                                // RST_STREAM (CANCEL 0x08) on the HTTP/2 stream, cleanly
+                                // aborting the request from the wire's perspective. The
+                                // in-flight flag is reset via the CompleteReport message
+                                // sent below regardless of which match arm fires.
+                                const HEARTBEAT_RPC_LOCAL_TIMEOUT: Duration =
+                                    Duration::from_secs(10);
+                                let rpc = sg.record_activity_heartbeat(
+                                    tt.clone(),
+                                    details.into_payloads(),
+                                );
+                                match tokio::time::timeout(HEARTBEAT_RPC_LOCAL_TIMEOUT, rpc).await
                                 {
-                                    Ok(RecordActivityTaskHeartbeatResponse {
+                                    Ok(Ok(RecordActivityTaskHeartbeatResponse {
                                            cancel_requested, activity_paused, activity_reset
-                                       }) => {
+                                       })) => {
                                         if cancel_requested || activity_paused || activity_reset {
                                             // Prioritize Cancel / reset over pause
                                             let reason = if cancel_requested {
@@ -177,7 +202,7 @@ impl ActivityHeartbeatManager {
                                     // Send cancels for any activity that learns its workflow already
                                     // finished (which is one thing not found implies - other reasons
                                     // would seem equally valid).
-                                    Err(s) if s.code() == tonic::Code::NotFound => {
+                                    Ok(Err(s)) if s.code() == tonic::Code::NotFound => {
                                         debug!(task_token = %tt,
                                            "Activity not found when recording heartbeat");
                                         cancels_tx
@@ -188,8 +213,19 @@ impl ActivityHeartbeatManager {
                                             ))
                                             .expect("Receive half of heartbeat cancels not blocked");
                                     }
-                                    Err(e) => {
+                                    Ok(Err(e)) => {
                                         warn!("Error when recording heartbeat: {:?}", e);
+                                    }
+                                    Err(_elapsed) => {
+                                        warn!(
+                                            task_token = %tt,
+                                            timeout_secs =
+                                                HEARTBEAT_RPC_LOCAL_TIMEOUT.as_secs(),
+                                            "Heartbeat RPC timed out locally; assuming socket \
+                                             wedged. In-flight flag will be reset via \
+                                             CompleteReport so subsequent heartbeats are not \
+                                             coalesced."
+                                        );
                                     }
                                 };
                                 let _ = heartbeat_tx.send(HeartbeatAction::CompleteReport(tt));
@@ -429,6 +465,8 @@ mod test {
     use super::*;
 
     use crate::worker::client::mocks::mock_worker_client;
+    use futures_util::FutureExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use temporalio_common::protos::temporal::api::{
         common::v1::Payload, workflowservice::v1::RecordActivityTaskHeartbeatResponse,
