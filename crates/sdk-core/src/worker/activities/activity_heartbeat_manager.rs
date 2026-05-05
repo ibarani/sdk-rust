@@ -677,12 +677,12 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn heartbeat_local_timeout_increments_metric() {
         // Local marker type for MetricsCallBuffer's I parameter.
-        // We don't resolve instrument refs in this test (we count
-        // Updates without filtering by instrument), so any
-        // BufferInstrumentRef impl works.
+        // Carries a sequential index so we can identify which Update
+        // events target our specific metric (vs auxiliary increments
+        // that may fire from unrelated paths).
         #[derive(Debug, Clone)]
-        struct UnusedInstrRef;
-        impl BufferInstrumentRef for UnusedInstrRef {}
+        struct LocalInstrRef(usize);
+        impl BufferInstrumentRef for LocalInstrRef {}
 
         // Mock client where record_activity_heartbeat NEVER completes,
         // simulating a silently-wedged TCP socket (no FIN/RST/GOAWAY).
@@ -697,7 +697,7 @@ mod test {
             });
 
         // Buffer-backed MetricsContext so we can observe increments.
-        let call_buffer: Arc<MetricsCallBuffer<UnusedInstrRef>> =
+        let call_buffer: Arc<MetricsCallBuffer<LocalInstrRef>> =
             Arc::new(MetricsCallBuffer::new(100));
         let telem_instance = telemetry_init(
             TelemetryOptions::builder()
@@ -719,7 +719,9 @@ mod test {
         // Yield aggressively so the spawned for_each_concurrent task
         // receives the message, dispatches through the stream, calls
         // the mock client, gets the pending future, and reaches the
-        // inner await on tokio::time::timeout(10s, ...).
+        // inner await on tokio::time::timeout(10s, ...). 50 is a
+        // generous over-yield; the actual chain has ~5-7 await points
+        // between record() and the timeout's inner await.
         for _ in 0..50 {
             tokio::task::yield_now().await;
         }
@@ -730,26 +732,61 @@ mod test {
         // then sends CompleteReport.
         tokio::time::advance(Duration::from_secs(11)).await;
 
-        // Yield so the closure's post-timeout code runs.
+        // Yield so the closure's post-timeout code runs (metric
+        // increment + warn! + CompleteReport send).
         for _ in 0..50 {
             tokio::task::yield_now().await;
         }
 
-        // Drain buffered events. The Err(_elapsed) closure's only
-        // metric call in the heartbeat path is our patched one, so
-        // we expect exactly one Update with Delta(1).
+        // Drain buffered events. Each Create event gets a sequential
+        // LocalInstrRef so subsequent Update events resolve to a
+        // specific instrument. We capture our metric's index and
+        // filter Updates by it — this is a tighter assertion than
+        // counting all Updates, which would couple the test to the
+        // global metric-call count of any auxiliary paths.
         let events = call_buffer.retrieve();
+        let mut our_metric_idx: Option<usize> = None;
+        let mut next_idx: usize = 0;
+        for event in &events {
+            if let MetricEvent::Create {
+                params,
+                populate_into,
+                ..
+            } = event
+            {
+                populate_into
+                    .set(Arc::new(LocalInstrRef(next_idx)))
+                    .unwrap();
+                // Match on the prefixed name (PrefixedMetricsMeter
+                // adds `temporal_` between Instruments::new and the
+                // CoreMeter sink). ends_with for prefix-robustness.
+                if params
+                    .name
+                    .ends_with("activity_heartbeat_rpc_local_timeout")
+                {
+                    our_metric_idx = Some(next_idx);
+                }
+                next_idx += 1;
+            }
+        }
+        let our_metric_idx = our_metric_idx
+            .expect("activity_heartbeat_rpc_local_timeout must be declared on Instruments");
+
+        // Filter Update events to only those targeting our metric.
         let updates: Vec<MetricUpdateVal> = events
             .iter()
             .filter_map(|e| match e {
-                MetricEvent::Update { update, .. } => Some(*update),
+                MetricEvent::Update {
+                    instrument, update, ..
+                } if instrument.get().0 == our_metric_idx => Some(*update),
                 _ => None,
             })
             .collect();
         assert_eq!(
             updates.len(),
             1,
-            "expected exactly one Update event from the Err(_elapsed) arm, got {}",
+            "expected exactly one Update event for activity_heartbeat_rpc_local_timeout \
+             from the Err(_elapsed) arm, got {}",
             updates.len()
         );
         assert!(
