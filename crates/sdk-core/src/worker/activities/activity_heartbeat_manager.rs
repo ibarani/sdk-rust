@@ -1,6 +1,7 @@
 use crate::{
     TaskToken,
     abstractions::take_cell::TakeCell,
+    telemetry::metrics::MetricsContext,
     worker::{activities::PendingActivityCancel, client::WorkerClient},
 };
 use futures_util::StreamExt;
@@ -91,6 +92,7 @@ impl ActivityHeartbeatManager {
     pub(super) fn new(
         client: Arc<dyn WorkerClient>,
         cancels_tx: UnboundedSender<PendingActivityCancel>,
+        metrics: MetricsContext,
     ) -> Self {
         let (heartbeat_stream_state, heartbeat_tx_source, shutdown_token) =
             HeartbeatStreamState::new();
@@ -131,6 +133,7 @@ impl ActivityHeartbeatManager {
                     let heartbeat_tx = heartbeat_tx_source.clone();
                     let sg = client.clone();
                     let cancels_tx = cancels_tx.clone();
+                    let metrics = metrics.clone();
                     async move {
                         match action {
                             HeartbeatExecutorAction::Sleep(tt, duration, cancellation_token) => {
@@ -157,12 +160,13 @@ impl ActivityHeartbeatManager {
                                 //
                                 // 10s is tuned to fire well before the 30s server-side
                                 // activity heartbeat_timeout while leaving generous headroom
-                                // for legitimate slow heartbeats over Tailscale/mTLS paths.
-                                // On timeout, the Tonic future is dropped — h2 will send
-                                // RST_STREAM (CANCEL 0x08) on the HTTP/2 stream, cleanly
-                                // aborting the request from the wire's perspective. The
-                                // in-flight flag is reset via the CompleteReport message
-                                // sent below regardless of which match arm fires.
+                                // for legitimate slow heartbeats over high-latency paths
+                                // (e.g. mTLS, mesh networks). On timeout, the Tonic future
+                                // is dropped; for h2 send streams that are not yet closed,
+                                // drop typically results in RST_STREAM(CANCEL 0x08) on the
+                                // wire, signaling cancellation to the peer. The in-flight
+                                // flag is reset via the CompleteReport message sent below
+                                // regardless of which match arm fires.
                                 const HEARTBEAT_RPC_LOCAL_TIMEOUT: Duration =
                                     Duration::from_secs(10);
                                 let rpc = sg.record_activity_heartbeat(
@@ -217,6 +221,7 @@ impl ActivityHeartbeatManager {
                                         warn!("Error when recording heartbeat: {:?}", e);
                                     }
                                     Err(_elapsed) => {
+                                        metrics.heartbeat_rpc_local_timeout();
                                         warn!(
                                             task_token = %tt,
                                             timeout_secs =
@@ -464,12 +469,20 @@ impl HeartbeatStreamState {
 mod test {
     use super::*;
 
-    use crate::worker::client::mocks::mock_worker_client;
+    use crate::telemetry::MetricsCallBuffer;
+    use crate::worker::client::mocks::{mock_manual_worker_client, mock_worker_client};
     use futures_util::FutureExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use temporalio_common::protos::temporal::api::{
         common::v1::Payload, workflowservice::v1::RecordActivityTaskHeartbeatResponse,
+    };
+    use temporalio_common::telemetry::{
+        TelemetryOptions,
+        metrics::{
+            CoreMeter,
+            core::{BufferInstrumentRef, MetricCallBufferer, MetricEvent, MetricUpdateVal},
+        },
+        telemetry_init,
     };
     use tokio::time::sleep;
 
@@ -483,7 +496,11 @@ mod test {
             .returning(|_, _| Ok(RecordActivityTaskHeartbeatResponse::default()))
             .times(2);
         let (cancel_tx, _cancel_rx) = unbounded_channel();
-        let hm = ActivityHeartbeatManager::new(Arc::new(mock_client), cancel_tx);
+        let hm = ActivityHeartbeatManager::new(
+            Arc::new(mock_client),
+            cancel_tx,
+            MetricsContext::no_op(),
+        );
         let fake_task_token = vec![1, 2, 3];
         // Send 2 heartbeat requests for 20ms apart.
         // The first heartbeat should be sent right away, and
@@ -505,7 +522,11 @@ mod test {
             .returning(|_, _| Ok(RecordActivityTaskHeartbeatResponse::default()))
             .times(3);
         let (cancel_tx, _cancel_rx) = unbounded_channel();
-        let hm = ActivityHeartbeatManager::new(Arc::new(mock_client), cancel_tx);
+        let hm = ActivityHeartbeatManager::new(
+            Arc::new(mock_client),
+            cancel_tx,
+            MetricsContext::no_op(),
+        );
         let fake_task_token = vec![1, 2, 3];
         // Heartbeats always get sent if recorded less frequently than the throttle interval
         for i in 0_u8..3 {
@@ -524,7 +545,11 @@ mod test {
             .returning(|_, _| Ok(RecordActivityTaskHeartbeatResponse::default()))
             .times(1);
         let (cancel_tx, _cancel_rx) = unbounded_channel();
-        let hm = ActivityHeartbeatManager::new(Arc::new(mock_client), cancel_tx);
+        let hm = ActivityHeartbeatManager::new(
+            Arc::new(mock_client),
+            cancel_tx,
+            MetricsContext::no_op(),
+        );
         let fake_task_token = vec![1, 2, 3];
         // Send a whole bunch of heartbeats very fast. We should still only send one total.
         for i in 0_u8..50 {
@@ -544,7 +569,11 @@ mod test {
             .returning(|_, _| Ok(RecordActivityTaskHeartbeatResponse::default()))
             .times(2);
         let (cancel_tx, _cancel_rx) = unbounded_channel();
-        let hm = ActivityHeartbeatManager::new(Arc::new(mock_client), cancel_tx);
+        let hm = ActivityHeartbeatManager::new(
+            Arc::new(mock_client),
+            cancel_tx,
+            MetricsContext::no_op(),
+        );
         let fake_task_token = vec![1, 2, 3];
         record_heartbeat(&hm, fake_task_token.clone(), 0, Duration::from_millis(100));
         sleep(Duration::from_millis(500)).await;
@@ -562,7 +591,11 @@ mod test {
             .returning(|_, _| Ok(RecordActivityTaskHeartbeatResponse::default()))
             .times(2);
         let (cancel_tx, _cancel_rx) = unbounded_channel();
-        let hm = ActivityHeartbeatManager::new(Arc::new(mock_client), cancel_tx);
+        let hm = ActivityHeartbeatManager::new(
+            Arc::new(mock_client),
+            cancel_tx,
+            MetricsContext::no_op(),
+        );
         let fake_task_token = vec![1, 2, 3];
         record_heartbeat(&hm, fake_task_token.clone(), 0, Duration::from_millis(100));
         // Let it propagate
@@ -583,7 +616,11 @@ mod test {
             .returning(|_, _| Ok(RecordActivityTaskHeartbeatResponse::default()))
             .times(1);
         let (cancel_tx, _cancel_rx) = unbounded_channel();
-        let hm = ActivityHeartbeatManager::new(Arc::new(mock_client), cancel_tx);
+        let hm = ActivityHeartbeatManager::new(
+            Arc::new(mock_client),
+            cancel_tx,
+            MetricsContext::no_op(),
+        );
         let fake_task_token = vec![1, 2, 3];
         record_heartbeat(&hm, fake_task_token.clone(), 0, Duration::from_millis(100));
         hm.evict(fake_task_token.clone().into(), true).await;
@@ -599,7 +636,11 @@ mod test {
             .returning(|_, _| Ok(RecordActivityTaskHeartbeatResponse::default()))
             .times(1);
         let (cancel_tx, _cancel_rx) = unbounded_channel();
-        let hm = ActivityHeartbeatManager::new(Arc::new(mock_client), cancel_tx);
+        let hm = ActivityHeartbeatManager::new(
+            Arc::new(mock_client),
+            cancel_tx,
+            MetricsContext::no_op(),
+        );
         let fake_task_token = vec![1, 2, 3];
 
         // Record initial heartbeat - this should be sent immediately
@@ -617,6 +658,105 @@ mod test {
         // Evict the activity with should_flush false
         // This should NOT send the stored heartbeat details since the activity completed successfully
         hm.evict(fake_task_token.into(), false).await;
+
+        hm.shutdown().await;
+    }
+
+    /// Behavioral regression test: when `record_activity_heartbeat`
+    /// hangs (silent socket-wedge simulation), the local 10s
+    /// `tokio::time::timeout` wrap fires and the patched closure
+    /// increments `MetricsContext::heartbeat_rpc_local_timeout()`.
+    /// Exercises the actual `Err(_elapsed)` arm —
+    /// `test_heartbeat_rpc_local_timeout_metric` (in metrics.rs)
+    /// only covers the direct method call.
+    ///
+    /// Uses `MockManualWorkerClient` (the mock that supports
+    /// returning arbitrary `impl Future`) with `future::pending`
+    /// for the heartbeat RPC, plus `tokio::time::pause`/`advance`
+    /// for virtual-clock control.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_local_timeout_increments_metric() {
+        // Local marker type for MetricsCallBuffer's I parameter.
+        // We don't resolve instrument refs in this test (we count
+        // Updates without filtering by instrument), so any
+        // BufferInstrumentRef impl works.
+        #[derive(Debug, Clone)]
+        struct UnusedInstrRef;
+        impl BufferInstrumentRef for UnusedInstrRef {}
+
+        // Mock client where record_activity_heartbeat NEVER completes,
+        // simulating a silently-wedged TCP socket (no FIN/RST/GOAWAY).
+        let mut mock_client = mock_manual_worker_client();
+        mock_client
+            .expect_record_activity_heartbeat()
+            .returning(|_, _| {
+                futures_util::future::pending::<
+                    std::result::Result<RecordActivityTaskHeartbeatResponse, tonic::Status>,
+                >()
+                .boxed()
+            });
+
+        // Buffer-backed MetricsContext so we can observe increments.
+        let call_buffer: Arc<MetricsCallBuffer<UnusedInstrRef>> =
+            Arc::new(MetricsCallBuffer::new(100));
+        let telem_instance = telemetry_init(
+            TelemetryOptions::builder()
+                .metrics(call_buffer.clone() as Arc<dyn CoreMeter>)
+                .build(),
+        )
+        .unwrap();
+        let mc = MetricsContext::top_level("ns".to_string(), "tq".to_string(), &telem_instance);
+
+        let (cancel_tx, _cancel_rx) = unbounded_channel();
+        let hm = ActivityHeartbeatManager::new(Arc::new(mock_client), cancel_tx, mc);
+
+        // Send a heartbeat. The first heartbeat for a token bypasses
+        // throttling and immediately enters the Report path:
+        // record_activity_heartbeat -> pending future ->
+        // tokio::time::timeout(10s, ...).
+        record_heartbeat(&hm, vec![1, 2, 3], 0, Duration::from_millis(50));
+
+        // Yield aggressively so the spawned for_each_concurrent task
+        // receives the message, dispatches through the stream, calls
+        // the mock client, gets the pending future, and reaches the
+        // inner await on tokio::time::timeout(10s, ...).
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        // Advance virtual time past the 10s local timeout. The
+        // timeout fires Err(_elapsed); the patched closure calls
+        // metrics.heartbeat_rpc_local_timeout(), then logs warn!,
+        // then sends CompleteReport.
+        tokio::time::advance(Duration::from_secs(11)).await;
+
+        // Yield so the closure's post-timeout code runs.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        // Drain buffered events. The Err(_elapsed) closure's only
+        // metric call in the heartbeat path is our patched one, so
+        // we expect exactly one Update with Delta(1).
+        let events = call_buffer.retrieve();
+        let updates: Vec<MetricUpdateVal> = events
+            .iter()
+            .filter_map(|e| match e {
+                MetricEvent::Update { update, .. } => Some(*update),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            updates.len(),
+            1,
+            "expected exactly one Update event from the Err(_elapsed) arm, got {}",
+            updates.len()
+        );
+        assert!(
+            matches!(updates[0], MetricUpdateVal::Delta(1)),
+            "expected Delta(1), got {:?}",
+            updates[0]
+        );
 
         hm.shutdown().await;
     }
