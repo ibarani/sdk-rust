@@ -722,18 +722,34 @@ mod test {
         // inner await on tokio::time::timeout(10s, ...). 50 is a
         // generous over-yield; the actual chain has ~5-7 await points
         // between record() and the timeout's inner await.
+        //
+        // DETERMINISM NOTE: this pattern is sound because
+        // `#[tokio::test(start_paused = true)]` defaults to the
+        // current_thread runtime (single-threaded, cooperative
+        // scheduling per https://docs.rs/tokio/latest/tokio/attr.test.html).
+        // Each `yield_now()` returns control to the scheduler, which
+        // runs the spawned task until it parks on its deepest await
+        // (the timeout's inner sleep) — under single-threaded paused
+        // time, 50 cycles deterministically drains the 5-7-await chain.
+        // Switching this test to a multi-threaded runtime would void
+        // this guarantee; if that ever happens, switch to an explicit
+        // synchronization primitive (e.g., a oneshot waited on by the
+        // closure) instead.
         for _ in 0..50 {
             tokio::task::yield_now().await;
         }
 
-        // Advance virtual time past the 10s local timeout. The
-        // timeout fires Err(_elapsed); the patched closure calls
-        // metrics.heartbeat_rpc_local_timeout(), then logs warn!,
-        // then sends CompleteReport.
+        // Advance virtual time past the 10s local timeout. The task
+        // is now parked on `tokio::time::timeout(10s, pending).await`;
+        // advance moves the deadline past now, which wakes the task.
+        // The timeout returns Err(_elapsed); the patched closure calls
+        // metrics.heartbeat_rpc_local_timeout(), then logs warn!, then
+        // sends CompleteReport.
         tokio::time::advance(Duration::from_secs(11)).await;
 
         // Yield so the closure's post-timeout code runs (metric
-        // increment + warn! + CompleteReport send).
+        // increment + warn! + CompleteReport send). Same single-threaded
+        // determinism reasoning as above.
         for _ in 0..50 {
             tokio::task::yield_now().await;
         }
