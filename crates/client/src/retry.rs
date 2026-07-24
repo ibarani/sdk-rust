@@ -63,13 +63,31 @@ impl Default for RetryOptions {
 }
 
 impl RetryOptions {
+    /// Retry policy for worker task long-polls.
+    ///
+    /// `max_elapsed_time` bounds how long a SINGLE logical poll call may spend in
+    /// the retry loop. Healthy long-polls return empty-success responses and thus
+    /// complete the call — every fresh poll constructs a fresh error handler (see
+    /// `make_future_retry`), so the elapsed budget never accumulates across
+    /// successful polls. Transient transport failures recover on the first few
+    /// backoff retries, well inside the budget. Only a PERSISTENT (>10 min)
+    /// continuous transport failure exhausts the budget, at which point the error
+    /// propagates out of the poller and sdk-core treats a non-shutdown poll error
+    /// as fatal (workflow_stream.rs: "Workflow processing encountered fatal error
+    /// and must shut down"), converting an infinite, silent poll outage into a
+    /// supervisable process exit (e.g. systemd `Restart=on-failure`).
+    ///
+    /// Reference: 2026-07-24 pp036 soak wedge — a client-side reconnect livelock
+    /// (every fresh dial aborted mid-TLS through a CONNECT proxy) caused a 4+ hour
+    /// invisible outage under the previous unlimited policy; a process restart
+    /// healed it instantly.
     pub(crate) const fn task_poll_retry_policy() -> Self {
         Self {
             initial_interval: Duration::from_millis(200),
             randomization_factor: 0.2,
             multiplier: 2.0,
             max_interval: Duration::from_secs(10),
-            max_elapsed_time: None,
+            max_elapsed_time: Some(Duration::from_secs(600)),
             max_retries: 0,
         }
     }
@@ -619,6 +637,40 @@ mod tests {
                 assert_matches!(result, RetryPolicy::WaitRetry(_));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn task_poll_bounded_by_max_elapsed_time() {
+        // The real task-poll policy must carry an elapsed-time bound so a single
+        // poll call stuck in a continuous transport-failure retry loop eventually
+        // propagates its error instead of livelocking forever (2026-07-24 pp036
+        // soak wedge).
+        let policy = RetryOptions::task_poll_retry_policy();
+        let budget = policy
+            .max_elapsed_time
+            .expect("task poll retry policy must bound elapsed time");
+        let mut err_handler = TonicErrorHandler::new_with_clock(
+            CallInfo {
+                call_type: CallType::TaskLongPoll,
+                call_name: POLL_WORKFLOW_METH_NAME,
+                retry_cfg: policy,
+                retry_short_circuit: None,
+            },
+            RetryOptions::throttle_retry_policy(),
+            FixedClock(Instant::now()),
+            FixedClock(Instant::now()),
+        );
+        // Within the budget, continuous retryable transport errors keep retrying.
+        let result = err_handler.handle(1, Status::new(Code::Unavailable, "connection reset"));
+        assert_matches!(result, RetryPolicy::WaitRetry(_));
+        // Once the elapsed budget is exhausted, the error is forwarded (fatal).
+        err_handler.backoff.clock.0 = err_handler
+            .backoff
+            .clock
+            .0
+            .add(budget + Duration::from_secs(1));
+        let result = err_handler.handle(2, Status::new(Code::Unavailable, "connection reset"));
+        assert_matches!(result, RetryPolicy::ForwardError(_));
     }
 
     #[tokio::test]
